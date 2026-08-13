@@ -23,10 +23,16 @@ __credits__ = {
     'Alexandre Zia': 'alexandre.zia@ifood.com.br'
 }
 
+
+def get_log_level(default):
+    """Return the configured log level using logging's canonical casing."""
+    return os.getenv("LOG_LEVEL", default).strip().upper()
+
+
 # logging setup
 logging.basicConfig(
   # format='[%(asctime)s] [%(levelname)s] %(message)s'
   format='[%(asctime)s] [%(levelname)s] [%(name)s:%(filename)s:%(lineno)s: %(funcName)s()] %(message)s'
 )
-logging.getLogger().setLevel(os.getenv("LOG_LEVEL", "FATAL"))
+logging.getLogger().setLevel(get_log_level("FATAL"))
 logger = logging.getLogger(__name__)

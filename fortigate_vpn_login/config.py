@@ -31,7 +31,10 @@ class Config(object):
         'quiet_mode': "True",
         'config_filename': utils.get_default_config_filepath() / 'config.ini',
         'openconnect_pid_filename': '/var/run/openconnect.pid',
-        'forti_url': ""
+        'forti_url': "",
+        'connection_name': "",
+        'tls_fingerprint': "",
+        'server_cert': ""
     }
 
     def __init__(self, name: Optional[str] = None, **kwargs: str) -> None:
@@ -85,6 +88,16 @@ class Config(object):
                 print("ERROR: Input should be string only!")
 
         self.set('forti_url', response)
+
+        prompts = (
+            ('connection_name', 'NetworkManager connection name'),
+            ('tls_fingerprint', 'VPN TLS SHA-256 fingerprint'),
+            ('server_cert', 'OpenConnect server certificate pin'),
+        )
+        for option, label in prompts:
+            current = self.get(option) or ''
+            response = str(input(f"{label} [{current}]: ")).strip()
+            self.set(option, response or current)
 
     def write(self, mkdir: bool = True) -> bool:
         """

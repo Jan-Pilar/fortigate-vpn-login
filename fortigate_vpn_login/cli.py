@@ -10,9 +10,10 @@ import os
 import sys
 import webbrowser
 import subprocess
+import tempfile
 from urllib.parse import urlsplit
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
-from fortigate_vpn_login import __version__, __description__, logger
+from fortigate_vpn_login import __version__, __description__, get_log_level, logger
 from fortigate_vpn_login import utils, config
 from fortigate_vpn_login.fortigate import Fortigate
 import fortigate_vpn_login.webserver as webserver
@@ -69,6 +70,10 @@ def main() -> int:
         dest='FORTI_URL'
     )
 
+    parser.add_argument('--connection-name', help='NetworkManager VPN connection name.')
+    parser.add_argument('--tls-fingerprint', help='SHA-256 fingerprint used when the server CA chain is broken.')
+    parser.add_argument('--server-cert', help='OpenConnect server pin (pin-sha256:...).')
+
     # windows don't have these options supported
     if not utils.is_windows():
         parser.add_argument(
@@ -92,19 +97,21 @@ def main() -> int:
     parser = parser.parse_args()
 
     if parser.DEBUG_MODE:
-        logger.setLevel("DEBUG")
-        logging.getLogger().setLevel(os.getenv("LOG_LEVEL", "DEBUG"))
+        log_level = get_log_level("DEBUG")
+        logger.setLevel(log_level)
+        logging.getLogger().setLevel(log_level)
         # TODO: on debug mode, change log format to
         # '[%(asctime)s] [%(levelname)s] [%(name)s:%(filename)s:%(lineno)s: %(funcName)s()] %(message)s'))
     else:
         # defaults to info
-        logger.setLevel("INFO")
-        logging.getLogger().setLevel(os.getenv("LOG_LEVEL", "INFO"))
+        log_level = get_log_level("INFO")
+        logger.setLevel(log_level)
+        logging.getLogger().setLevel(log_level)
 
     if parser.QUIET_MODE:
         logging.disable(logging.CRITICAL)
 
-    if parser.FOREGROUND:
+    if getattr(parser, 'FOREGROUND', False):
         parser.BACKGROUND = False
 
     # load configuration
@@ -134,7 +141,8 @@ def main() -> int:
         fortigate_vpn_url = parser.FORTI_URL
 
     # establish connection to the Fortigate VPN Server, grab info, etc
-    fortigate = Fortigate(fortigate_vpn_url)
+    tls_fingerprint = parser.tls_fingerprint or options.get('tls_fingerprint') or None
+    fortigate = Fortigate(fortigate_vpn_url, tls_fingerprint=tls_fingerprint)
     url = fortigate.connect_saml()
     if not url:
         return 1
@@ -150,76 +158,87 @@ def main() -> int:
         return 1
 
     cookie_svpn = fortigate.get_cookie(auth_id)
+    if not cookie_svpn:
+        print("ERROR: FortiGate did not return an SVPNCOOKIE after SAML authentication.")
+        return 1
 
-    PASSWD_FILE = os.path.expanduser("~/.fortigate-vpn-cookie")
+    connection_name = parser.connection_name or options.get('connection_name')
+    connection_name = connection_name or urlsplit(fortigate_vpn_url).hostname
+    server_cert = parser.server_cert or options.get('server_cert')
+    if not server_cert:
+        print('ERROR: "server_cert" is not set. Run --configure and provide the pin-sha256 value.')
+        return 2
 
-    with open(PASSWD_FILE, 'w') as f:
-        f.write(f"vpn.secrets.cookie:SVPNCOOKIE={cookie_svpn}\n")
-        # TODO: handle hardcoded cert fingerprint
-        # echo | openssl s_client -connect vpn2.xitee.com:443 | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl enc -base64
-        f.write("vpn.secrets.gwcert:pin-sha256:6M/QEkhI1ayxPVbNDI3PZD4ooJ4Kwa/g1Iac27FKI4c=\n")
-        f.write(f"vpn.secrets.gateway:{urlsplit(fortigate_vpn_url).netloc}\n")
-        f.write("vpn.secrets.resolve:\n")
-
-    nmcli_command = [
-        f"/usr/bin/nmcli",
-        "con",
-        "up",
-        f"{urlsplit(fortigate_vpn_url).netloc}",
-        "passwd-file",
-        f"{PASSWD_FILE}",
-    ]
-
-    openconnect_arguments = [
-        "--protocol=fortinet",
-        f"--server={fortigate_vpn_url}",
-        f"--useragent=fortigate-vpn-login-{__version__}:{os.uname().version}",
-        "--no-dtls",
-        "--non-inter",
-        "--disable-ipv6",
-        f"--cookie=SVPNCOOKIE={cookie_svpn}",
-    ]
-
-    if parser.QUIET_MODE:
-        openconnect_arguments.append("--quiet")
-
-    if parser.DEBUG_MODE:
-        openconnect_arguments.append("--verbose")
-
-    if parser.BACKGROUND:
-        openconnect_arguments.append("--quiet")
-        openconnect_arguments.append("--background")
-
-    command_line = []
-    if utils.is_windows():
-        workdir = openconnect_path.parent
-        command_line = [
-            "powershell",
-            "-Command",
-            f"Start-Process '{str(openconnect_path)}' "
-            f"-ArgumentList {','.join(openconnect_arguments)} "
-            f"-Verb runAs -WorkingDirectory {workdir}",
-        ]
-    else:
-        if not os.getuid() == 0:
-            # TODO: make option to use nmcli or openconnect
-            #command_line.append("sudo")
-            #command_line = command_line + [str(openconnect_path)] + openconnect_arguments
-            command_line = nmcli_command
-            print(command_line)
-
-    env = os.environ.copy()
-    env['LC_ALL'] = 'C'
-
+    password_file = tempfile.NamedTemporaryFile(
+        mode='w', prefix='fortigate-vpn-', delete=False
+    )
     try:
-        if not parser.BACKGROUND:
-            subprocess.run(command_line, env=env)
+        password_file.write(f"vpn.secrets.cookie:SVPNCOOKIE={cookie_svpn}\n")
+        password_file.write(f"vpn.secrets.gwcert:{server_cert}\n")
+        password_file.write(f"vpn.secrets.gateway:{urlsplit(fortigate_vpn_url).netloc}\n")
+        password_file.write("vpn.secrets.resolve:\n")
+        password_file.close()
+        os.chmod(password_file.name, 0o600)
+
+        nmcli_command = [
+            "/usr/bin/nmcli", "con", "up", connection_name,
+            "passwd-file", password_file.name,
+        ]
+
+        openconnect_arguments = [
+            "--protocol=fortinet",
+            f"--server={fortigate_vpn_url}",
+            f"--useragent=fortigate-vpn-login-{__version__}:{os.uname().version}",
+            "--no-dtls",
+            "--non-inter",
+            "--disable-ipv6",
+            f"--cookie=SVPNCOOKIE={cookie_svpn}",
+        ]
+
+        if parser.QUIET_MODE:
+            openconnect_arguments.append("--quiet")
+
+        if parser.DEBUG_MODE:
+            openconnect_arguments.append("--verbose")
+
+        if parser.BACKGROUND:
+            openconnect_arguments.append("--quiet")
+            openconnect_arguments.append("--background")
+
+        command_line = []
+        if utils.is_windows():
+            workdir = openconnect_path.parent
+            command_line = [
+                "powershell",
+                "-Command",
+                f"Start-Process '{str(openconnect_path)}' "
+                f"-ArgumentList {','.join(openconnect_arguments)} "
+                f"-Verb runAs -WorkingDirectory {workdir}",
+            ]
         else:
-            subprocess.run(command_line, env=env,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except KeyboardInterrupt:
-        logger.debug("User interrupted process.")
-        print("CTRL+C/SIGTERM detected. Exiting.")
+            if not os.getuid() == 0:
+                command_line = nmcli_command
+            else:
+                command_line = [str(openconnect_path)] + openconnect_arguments
+
+        env = os.environ.copy()
+        env['LC_ALL'] = 'C'
+
+        try:
+            result = subprocess.run(command_line, env=env)
+            if result.returncode:
+                print(f"ERROR: VPN activation failed (exit code {result.returncode}).")
+                return 1
+        except KeyboardInterrupt:
+            logger.debug("User interrupted process.")
+            print("CTRL+C/SIGTERM detected. Exiting.")
+            return 130
+    finally:
+        password_file.close()
+        try:
+            os.unlink(password_file.name)
+        except FileNotFoundError:
+            pass
 
     return 0
 

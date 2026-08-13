@@ -127,6 +127,9 @@ def check_openconnect_version(openconnect_path: Path) -> bool:
     Returns:
         bool: True if compatible. False if not.
     """
+    if openconnect_path is None:
+        return False
+
     env = os.environ.copy()
     env['LC_ALL'] = 'C'
     process = subprocess.run([openconnect_path, '--version'], env=env, capture_output=True)
@@ -142,6 +145,8 @@ def check_openconnect_version(openconnect_path: Path) -> bool:
 
     # openconnect fortinet support
     match = re.search(r'^Supported protocols: (.*?)$', output, re.MULTILINE)
+    if not match:
+        return False
     openconnect_supported_protocols = match.group(1)
     openconnect_supported_protocols = openconnect_supported_protocols.replace("(default)", "")
     openconnect_supported_protocols = [x.strip() for x in openconnect_supported_protocols.split(',')]

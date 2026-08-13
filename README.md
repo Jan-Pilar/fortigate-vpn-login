@@ -20,6 +20,24 @@ To initiate the SAML workflow on a fortigate ssl vpn server:
 fortigate-vpn-login -s https://vpn-server.example.com
 ```
 
+When the FortiGate does not serve a complete TLS certificate chain, configure
+both certificate pins instead of disabling certificate validation:
+
+```bash
+fortigate-vpn-login --configure
+```
+
+The configuration asks for:
+
+- the NetworkManager VPN connection name;
+- the leaf certificate SHA-256 fingerprint used by the SAML HTTPS requests;
+- the OpenConnect `pin-sha256:...` public-key pin.
+
+Certificate pins must be updated after a legitimate server certificate/key
+rotation. The VPN is then started with `fortigate-vpn-login`; activating the
+NetworkManager profile directly does not perform this wrapper's SAML-cookie
+workflow.
+
 To get help and more options:
 
 ```bash
