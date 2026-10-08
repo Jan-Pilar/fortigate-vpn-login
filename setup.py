@@ -39,6 +39,7 @@ setup(
     packages=find_packages(include=['fortigate_vpn_login']),
     python_requires=">=3.8, <4",
     install_requires=[
+        'cryptography>=41.0.0',
         'requests==2.31.0',
         'xmltodict==0.13.0',
         'beautifulsoup4==4.12.2',

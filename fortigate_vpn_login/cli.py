@@ -11,12 +11,38 @@ import sys
 import webbrowser
 import subprocess
 import tempfile
+import hashlib
+from pathlib import Path
 from urllib.parse import urlsplit
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from fortigate_vpn_login import __version__, __description__, get_log_level, logger
 from fortigate_vpn_login import utils, config
-from fortigate_vpn_login.fortigate import Fortigate
+from fortigate_vpn_login.fortigate import Fortigate, report_tls_failure
+from fortigate_vpn_login.tls import refresh_pins, TLSRefreshError
 import fortigate_vpn_login.webserver as webserver
+
+
+def update_tls_pins(options, url, persist=True):
+    """Save both pins together, and only after the endpoint has been verified."""
+    cache_name = hashlib.sha256(url.rstrip('/').encode('utf-8')).hexdigest()[:16]
+    cache_path = Path(options.config_filename).parent / ('intermediates-' + cache_name + '.pem')
+    pins = refresh_pins(url, cache_path=cache_path)
+    if persist:
+        previous = {key: options.get(key) for key in ('tls_fingerprint', 'server_cert')}
+        options.set('tls_fingerprint', pins.tls_fingerprint)
+        options.set('server_cert', pins.server_cert)
+        if not options.write():
+            for key, value in previous.items():
+                options.set(key, value)
+            raise TLSRefreshError('Could not save the verified certificate pins.')
+        if (previous['tls_fingerprint'] != pins.tls_fingerprint
+                or previous['server_cert'] != pins.server_cert):
+            print('VPN certificate verified; TLS fingerprint and OpenConnect pin updated automatically.')
+        else:
+            print('VPN certificate verified; stored pins are up to date.')
+    else:
+        print('VPN certificate verified; current pins will be used for this connection.')
+    return pins
 
 
 def main() -> int:
@@ -73,6 +99,10 @@ def main() -> int:
     parser.add_argument('--connection-name', help='NetworkManager VPN connection name.')
     parser.add_argument('--tls-fingerprint', help='SHA-256 fingerprint used when the server CA chain is broken.')
     parser.add_argument('--server-cert', help='OpenConnect server pin (pin-sha256:...).')
+    parser.add_argument('--auto-tls', action='store_true',
+                        help='Enable and save automatic CA-verified certificate refresh.')
+    parser.add_argument('--refresh-cert', action='store_true',
+                        help='Verify and update certificate pins without opening the browser or connecting VPN.')
 
     # windows don't have these options supported
     if not utils.is_windows():
@@ -120,16 +150,7 @@ def main() -> int:
     # do we need to configure interactively?
     if parser.INTERACTIVE_CONFIGURE:
         options.configure()
-        options.write()
-        return 0
-
-    openconnect_path = utils.find_openconnect()
-
-    # openconnect compatability check
-    if not utils.check_openconnect_version(openconnect_path):
-        print("ERROR: Your openconnect version isn't compatible with this program. "
-              "Make sure you have the latest version, which supports the \"fortinet\" protocol.")
-        return 1
+        return 0 if options.write() else 1
 
     # server url
     if not parser.FORTI_URL:
@@ -140,12 +161,58 @@ def main() -> int:
     else:
         fortigate_vpn_url = parser.FORTI_URL
 
-    # establish connection to the Fortigate VPN Server, grab info, etc
+    auto_tls = parser.auto_tls or options.getboolean('auto_tls')
+    if auto_tls and (parser.tls_fingerprint or parser.server_cert):
+        print('ERROR: Explicit certificate pins cannot be combined with automatic refresh. '
+              'Use --configure to disable automatic refresh for manual pins.')
+        return 2
+    persist_pins = not parser.FORTI_URL or fortigate_vpn_url.rstrip('/') == (options.get('forti_url') or '').rstrip('/')
+    if parser.auto_tls or parser.refresh_cert:
+        options.set('forti_url', fortigate_vpn_url)
+        if parser.connection_name:
+            options.set('connection_name', parser.connection_name)
+        if parser.auto_tls:
+            options.set('auto_tls', 'True')
+        persist_pins = True
+    current_pins = None
+
+    def renew_certificate():
+        nonlocal current_pins
+        current_pins = update_tls_pins(options, fortigate_vpn_url, persist=persist_pins)
+        return current_pins
+
+    if parser.refresh_cert:
+        try:
+            renew_certificate()
+        except TLSRefreshError as error:
+            report_tls_failure(fortigate_vpn_url, error)
+            return 1
+        print('VPN certificate verified and both pins updated.'
+              + (' Automatic refresh is enabled.' if auto_tls else ''))
+        return 0
+
+    openconnect_path = utils.find_openconnect()
+    if not utils.check_openconnect_version(openconnect_path):
+        print("ERROR: Your openconnect version isn't compatible with this program. "
+              "Make sure you have the latest version, which supports the \"fortinet\" protocol.")
+        return 1
+
+    # Automatic mode starts with normal CA validation, so expired certificates
+    # cannot be silently accepted by an old stored fingerprint.
     tls_fingerprint = parser.tls_fingerprint or options.get('tls_fingerprint') or None
-    fortigate = Fortigate(fortigate_vpn_url, tls_fingerprint=tls_fingerprint)
+    fortigate = Fortigate(fortigate_vpn_url, tls_fingerprint=None if auto_tls else tls_fingerprint,
+                         tls_refresh=renew_certificate if auto_tls else None)
     url = fortigate.connect_saml()
     if not url:
         return 1
+    if auto_tls and current_pins is None:
+        # A server serving a full chain may rotate its key without a TLS error.
+        # Refresh the OpenConnect pin before handing it any credentials too.
+        try:
+            renew_certificate()
+        except TLSRefreshError as error:
+            report_tls_failure(fortigate_vpn_url, error)
+            return 1
 
     # webserver to get the response from the IDP through browser request
     ws = webserver.run()
@@ -164,7 +231,7 @@ def main() -> int:
 
     connection_name = parser.connection_name or options.get('connection_name')
     connection_name = connection_name or urlsplit(fortigate_vpn_url).hostname
-    server_cert = parser.server_cert or options.get('server_cert')
+    server_cert = current_pins.server_cert if current_pins else parser.server_cert or options.get('server_cert')
     if not server_cert:
         print('ERROR: "server_cert" is not set. Run --configure and provide the pin-sha256 value.')
         return 2
@@ -187,6 +254,7 @@ def main() -> int:
 
         openconnect_arguments = [
             "--protocol=fortinet",
+            f"--servercert={server_cert}",
             f"--server={fortigate_vpn_url}",
             f"--useragent=fortigate-vpn-login-{__version__}:{os.uname().version}",
             "--no-dtls",

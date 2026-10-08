@@ -7,6 +7,7 @@
 """
 import os
 import configparser
+import tempfile
 from typing import Optional
 from pathlib import Path
 from fortigate_vpn_login import utils, logger
@@ -33,6 +34,7 @@ class Config(object):
         'openconnect_pid_filename': '/var/run/openconnect.pid',
         'forti_url': "",
         'connection_name': "",
+        'auto_tls': "False",
         'tls_fingerprint': "",
         'server_cert': ""
     }
@@ -89,8 +91,17 @@ class Config(object):
 
         self.set('forti_url', response)
 
+        current = self.get('connection_name') or ''
+        response = input(f"NetworkManager connection name [{current}]: ").strip()
+        self.set('connection_name', response or current)
+        while True:
+            response = input('Automatically refresh CA-verified VPN certificates? [Y/n]: ').strip().lower()
+            if response in ('', 'y', 'yes', 'n', 'no'):
+                break
+        self.set('auto_tls', 'False' if response in ('n', 'no') else 'True')
+        if self.getboolean('auto_tls'):
+            return
         prompts = (
-            ('connection_name', 'NetworkManager connection name'),
             ('tls_fingerprint', 'VPN TLS SHA-256 fingerprint'),
             ('server_cert', 'OpenConnect server certificate pin'),
         )
@@ -111,18 +122,27 @@ class Config(object):
         Returns:
             bool: True if the save was successful. False if not.
         """
+        temporary_filename = None
         try:
             logger.debug(f"Creating directories for file {self.config_filename}")
-            os.makedirs(Path(self.config_filename).parent, mode=0o700, exist_ok=True)
+            if mkdir:
+                os.makedirs(Path(self.config_filename).parent, mode=0o700, exist_ok=True)
 
             logger.debug(f"Writing configuration to file {self.config_filename}")
-            with open(self.config_filename, 'w') as fp:
+            with tempfile.NamedTemporaryFile(mode='w', dir=Path(self.config_filename).parent,
+                                             prefix='.config-', delete=False) as fp:
+                temporary_filename = fp.name
                 self.config.write(fp)
-            os.chmod(self.config_filename, 0o0600)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(temporary_filename, self.config_filename)
         except Exception as e:
             print(f"ERROR: Could not write to config file: {str(self.config_filename)}.")
             logger.debug(e)
             return False
+        finally:
+            if temporary_filename and os.path.exists(temporary_filename):
+                os.unlink(temporary_filename)
 
         return True
 

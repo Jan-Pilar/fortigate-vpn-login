@@ -14,6 +14,24 @@ from typing import Optional
 from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
 from fortigate_vpn_login import logger
+from fortigate_vpn_login.tls import TLSRefreshError
+
+
+def report_tls_failure(url, cause=None):
+    print(
+        f"ERROR: TLS certificate verification failed for {url}. "
+        "Check that the FortiGate serves the full certificate chain "
+        "(including intermediate certificates)."
+    )
+    if cause:
+        print(f"Automatic certificate refresh failed: {cause}")
+    print(
+        "Manual recovery: ask the VPN administrator to install the missing intermediate "
+        "CA certificates on the FortiGate. Alternatively, obtain the current certificate "
+        "SHA-256 fingerprint and OpenConnect pin-sha256 public-key pin from the administrator, "
+        "run fortigate-vpn-login --configure, choose 'n' for automatic refresh and enter both pins. "
+        "Do not disable TLS verification."
+    )
 
 
 class FingerprintAdapter(HTTPAdapter):
@@ -24,12 +42,19 @@ class FingerprintAdapter(HTTPAdapter):
         super().__init__(*args, **kwargs)
 
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs.update(self._tls_options())
+        return super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        # The CONNECT target must be pinned even when Requests uses a proxy.
+        proxy_kwargs.update(self._tls_options())
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+    def _tls_options(self):
         ssl_context = create_urllib3_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        pool_kwargs["ssl_context"] = ssl_context
-        pool_kwargs["assert_fingerprint"] = self.fingerprint
-        return super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+        return {"ssl_context": ssl_context, "assert_fingerprint": self.fingerprint}
 
     def cert_verify(self, conn, url, verify, cert):
         # urllib3's assert_fingerprint performs the peer verification instead.
@@ -42,7 +67,7 @@ class Fortigate(object):
     """
     Represents a Fortigate VPN Server connection
     """
-    def __init__(self, url: str, tls_fingerprint: Optional[str] = None) -> None:
+    def __init__(self, url: str, tls_fingerprint: Optional[str] = None, tls_refresh=None) -> None:
         """
         Creates a connection with a Fortigate VPN Server
 
@@ -53,8 +78,10 @@ class Fortigate(object):
         self.json_config = None
         self.url = url.rstrip('/')
         self.session = requests.Session()
+        self.tls_refresh = tls_refresh
+        self.tls_refreshed = False
         if tls_fingerprint:
-            self.session.mount("https://", FingerprintAdapter(tls_fingerprint))
+            self.session.mount(self.url + '/', FingerprintAdapter(tls_fingerprint))
 
     def connect_saml(self) -> Optional[str]:
         """
@@ -75,12 +102,18 @@ class Fortigate(object):
 
         # SSLError inherits from ConnectionError, so it must be handled first.
         except requests.exceptions.SSLError as e:
-            print(
-                f"ERROR: TLS certificate verification failed for {self.url}. "
-                "Check that the FortiGate serves the full certificate chain "
-                "(including intermediate certificates)."
-            )
             logger.debug("TLS certificate verification failed: %s", e)
+            if self.tls_refresh and not self.tls_refreshed:
+                self.tls_refreshed = True  # Retry at most once, even if refresh fails.
+                print('TLS verification failed; attempting a CA-verified certificate refresh...')
+                try:
+                    pins = self.tls_refresh()
+                except TLSRefreshError as error:
+                    report_tls_failure(self.url, error)
+                    return None
+                self.session.mount(self.url + '/', FingerprintAdapter(pins.tls_fingerprint))
+                return self.connect_saml()
+            report_tls_failure(self.url, e if self.tls_refreshed else None)
             return None
 
         except requests.exceptions.Timeout as e:

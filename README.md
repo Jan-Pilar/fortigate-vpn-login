@@ -20,23 +20,58 @@ To initiate the SAML workflow on a fortigate ssl vpn server:
 fortigate-vpn-login -s https://vpn-server.example.com
 ```
 
-When the FortiGate does not serve a complete TLS certificate chain, configure
-both certificate pins instead of disabling certificate validation:
+To enable automatic certificate handling once for your existing VPN profile:
+
+```bash
+fortigate-vpn-login --auto-tls --refresh-cert
+```
+
+This verifies the current server certificate, calculates and saves both the
+TLS SHA-256 fingerprint and the OpenConnect `pin-sha256:...` public-key pin,
+and enables automatic updates. The VPN URL and NetworkManager connection name
+are preserved. The command does not open the browser or activate the VPN.
+For a new configuration, specify the URL and profile name:
+
+```bash
+fortigate-vpn-login -s https://vpn-server.example.com --connection-name my-vpn --auto-tls --refresh-cert
+```
+
+Then connect normally:
+
+```bash
+fortigate-vpn-login
+```
+
+In automatic mode, a TLS verification error triggers one certificate-refresh
+attempt and one SAML retry. Missing intermediates are downloaded from the
+certificate's CA Issuers (AIA) URLs and cached locally. A fresh TLS handshake
+must validate the hostname, certificate lifetime and chain to an already
+trusted root before either pin is saved. Downloaded certificates never become
+new root trust anchors. Expired, self-signed, wrong-hostname and untrusted
+certificates are rejected. Updates are announced without asking for input;
+failed verification preserves the previous pins and prints manual instructions.
+Servers serving a complete chain also have their current public-key pin checked
+before SAML login continues, so a legitimate key rotation updates both pins.
+
+`--refresh-cert` can also refresh the saved pins on demand without connecting.
+Automatic mode works when starting this wrapper; activating a NetworkManager
+profile directly does not run its SAML or certificate-refresh workflow.
+
+To use administrator-confirmed manual pins instead, run:
 
 ```bash
 fortigate-vpn-login --configure
 ```
 
-The configuration asks for:
+Choose `n` at the automatic-refresh prompt. The configuration then asks for:
 
 - the NetworkManager VPN connection name;
 - the leaf certificate SHA-256 fingerprint used by the SAML HTTPS requests;
 - the OpenConnect `pin-sha256:...` public-key pin.
 
-Certificate pins must be updated after a legitimate server certificate/key
-rotation. The VPN is then started with `fortigate-vpn-login`; activating the
-NetworkManager profile directly does not perform this wrapper's SAML-cookie
-workflow.
+Manual certificate pins must be updated after a legitimate server certificate/key
+rotation. Do not disable certificate verification. Installing the complete
+intermediate chain on the FortiGate remains the permanent server-side fix.
 
 To get help and more options:
 
@@ -61,3 +96,9 @@ pip install -e .
 Note that this will also install the local dependencies, which might change after
 some time. If needed, you can run `pip install -e .` again to reinstall the
 updated dependencies anytime.
+
+Run the automated tests (including local TLS servers with generated certificates):
+
+```bash
+python3 -m unittest discover -v
+```
