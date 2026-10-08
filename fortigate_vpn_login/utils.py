@@ -14,6 +14,7 @@ from shutil import which
 from pathlib import Path
 from enum import Enum, auto
 from fortigate_vpn_login import logger
+from fortigate_vpn_login.tls import refresh_pins, TLSRefreshError
 
 
 class VPNStatus(Enum):
@@ -114,6 +115,33 @@ def get_openconnect_pid(pid_file: str) -> int:
         pid = None
 
     return pid
+
+
+def get_gateway_cert_hash(host: str, port: int = 443) -> Optional[str]:
+    """
+    Verifies the TLS certificate presented by the VPN gateway and returns its public-key
+    fingerprint in the `pin-sha256:` form understood by `openconnect --servercert` (and
+    NetworkManager's `vpn.secrets.gwcert`).
+
+    Computing this at runtime avoids shipping a hardcoded pin that breaks whenever the gateway
+    certificate is renewed.
+
+    Args:
+        host (str): The gateway hostname.
+        port (int): The gateway TLS port. Defaults to 443.
+
+    Returns:
+        str|Optional: `pin-sha256:<base64>` digest of the certificate's SubjectPublicKeyInfo,
+        or None on failure.
+    """
+    # Share the same CA-verified pin derivation as automatic certificate refresh.
+    # IPv6 literals need brackets in an HTTPS origin.
+    hostname = '[%s]' % host if ':' in host and not host.startswith('[') else host
+    try:
+        return refresh_pins('https://%s:%d' % (hostname, port)).server_cert
+    except TLSRefreshError as e:
+        logger.debug(f"Could not verify gateway certificate from {host}:{port}: {e}")
+        return None
 
 
 def check_openconnect_version(openconnect_path: Path) -> bool:
