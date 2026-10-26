@@ -73,6 +73,27 @@ Manual certificate pins must be updated after a legitimate server certificate/ke
 rotation. Do not disable certificate verification. Installing the complete
 intermediate chain on the FortiGate remains the permanent server-side fix.
 
+To keep the VPN up until you disconnect it yourself, and log in again automatically
+whenever it drops or the session expires:
+
+```bash
+fortigate-vpn-login --keep-alive              # until disconnected by the user or CTRL+C
+fortigate-vpn-login --keep-alive --max-time 8h  # and disconnect after 8 hours
+```
+
+The wrapper stays running and watches the NetworkManager connection. When the
+tunnel goes down for any reason other than a user disconnect, it reports the
+cause (e.g. dead peer detection, session expired, network change) on the
+terminal and as a desktop notification, then repeats the SAML login. If the
+identity provider session is still valid, the browser login completes without
+input. `keep_alive = True` in the config file enables this by default.
+
+This is needed because FortiGate servers with `tunnel-connect-without-reauth`
+disabled reject OpenConnect's own reconnect after a dead peer is detected
+("reconnect-after-drop is not allowed"). Enabling it on the FortiGate
+(`config vpn ssl settings` / `set tunnel-connect-without-reauth enable`) lets
+short drops recover without a new login.
+
 To get help and more options:
 
 ```bash

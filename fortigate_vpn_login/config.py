@@ -35,6 +35,7 @@ class Config(object):
         'forti_url': "",
         'connection_name': "",
         'auto_tls': "False",
+        'keep_alive': "False",
         'tls_fingerprint': "",
         'server_cert': ""
     }

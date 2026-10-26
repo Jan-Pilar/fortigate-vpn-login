@@ -12,11 +12,13 @@ import webbrowser
 import subprocess
 import tempfile
 import hashlib
+import time
+from typing import Optional
 from pathlib import Path
 from urllib.parse import urlsplit
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from fortigate_vpn_login import __version__, __description__, get_log_level, logger
-from fortigate_vpn_login import utils, config
+from fortigate_vpn_login import utils, config, keepalive
 from fortigate_vpn_login.fortigate import Fortigate, report_tls_failure
 from fortigate_vpn_login.tls import refresh_pins, TLSRefreshError
 import fortigate_vpn_login.webserver as webserver
@@ -103,6 +105,11 @@ def main() -> int:
                         help='Enable and save automatic CA-verified certificate refresh.')
     parser.add_argument('--refresh-cert', action='store_true',
                         help='Verify and update certificate pins without opening the browser or connecting VPN.')
+    parser.add_argument('--keep-alive', action='store_true',
+                        help='Stay running and log in again whenever the VPN drops or expires, '
+                             'until the user disconnects it or presses CTRL+C.')
+    parser.add_argument('--max-time', metavar='DURATION',
+                        help='With --keep-alive: disconnect after this time (e.g. 90m, 8h). Implies --keep-alive.')
 
     # windows don't have these options supported
     if not utils.is_windows():
@@ -200,115 +207,177 @@ def main() -> int:
     # Automatic mode starts with normal CA validation, so expired certificates
     # cannot be silently accepted by an old stored fingerprint.
     tls_fingerprint = parser.tls_fingerprint or options.get('tls_fingerprint') or None
-    fortigate = Fortigate(fortigate_vpn_url, tls_fingerprint=None if auto_tls else tls_fingerprint,
-                         tls_refresh=renew_certificate if auto_tls else None)
-    url = fortigate.connect_saml()
-    if not url:
-        return 1
-    if auto_tls and current_pins is None:
-        # A server serving a full chain may rotate its key without a TLS error.
-        # Refresh the OpenConnect pin before handing it any credentials too.
-        try:
-            renew_certificate()
-        except TLSRefreshError as error:
-            report_tls_failure(fortigate_vpn_url, error)
-            return 1
-
-    # webserver to get the response from the IDP through browser request
-    ws = webserver.run()
-    webbrowser.open(url)
-    auth_id = webserver.return_token()
-    webserver.quit(ws)
-
-    if auth_id == '-1':
-        print("ERROR: Invalid ID from provider. Try again or contact your provider support.")
-        return 1
-
-    cookie_svpn = fortigate.get_cookie(auth_id)
-    if not cookie_svpn:
-        print("ERROR: FortiGate did not return an SVPNCOOKIE after SAML authentication.")
-        return 1
-
     connection_name = parser.connection_name or options.get('connection_name')
     connection_name = connection_name or urlsplit(fortigate_vpn_url).hostname
-    server_cert = current_pins.server_cert if current_pins else parser.server_cert or options.get('server_cert')
-    if not server_cert:
-        print('ERROR: "server_cert" is not set. Run --configure and provide the pin-sha256 value.')
-        return 2
 
-    password_file = tempfile.NamedTemporaryFile(
-        mode='w', prefix='fortigate-vpn-', delete=False
-    )
-    try:
-        password_file.write(f"vpn.secrets.cookie:SVPNCOOKIE={cookie_svpn}\n")
-        password_file.write(f"vpn.secrets.gwcert:{server_cert}\n")
-        password_file.write(f"vpn.secrets.gateway:{urlsplit(fortigate_vpn_url).netloc}\n")
-        password_file.write("vpn.secrets.resolve:\n")
-        password_file.close()
-        os.chmod(password_file.name, 0o600)
-
-        nmcli_command = [
-            "/usr/bin/nmcli", "con", "up", connection_name,
-            "passwd-file", password_file.name,
-        ]
-
-        openconnect_arguments = [
-            "--protocol=fortinet",
-            f"--servercert={server_cert}",
-            f"--server={fortigate_vpn_url}",
-            f"--useragent=fortigate-vpn-login-{__version__}:{os.uname().version}",
-            "--no-dtls",
-            "--non-inter",
-            "--disable-ipv6",
-            f"--cookie=SVPNCOOKIE={cookie_svpn}",
-        ]
-
-        if parser.QUIET_MODE:
-            openconnect_arguments.append("--quiet")
-
-        if parser.DEBUG_MODE:
-            openconnect_arguments.append("--verbose")
-
-        if parser.BACKGROUND:
-            openconnect_arguments.append("--quiet")
-            openconnect_arguments.append("--background")
-
-        command_line = []
-        if utils.is_windows():
-            workdir = openconnect_path.parent
-            command_line = [
-                "powershell",
-                "-Command",
-                f"Start-Process '{str(openconnect_path)}' "
-                f"-ArgumentList {','.join(openconnect_arguments)} "
-                f"-Verb runAs -WorkingDirectory {workdir}",
-            ]
-        else:
-            if not os.getuid() == 0:
-                command_line = nmcli_command
-            else:
-                command_line = [str(openconnect_path)] + openconnect_arguments
-
-        env = os.environ.copy()
-        env['LC_ALL'] = 'C'
-
-        try:
-            result = subprocess.run(command_line, env=env)
-            if result.returncode:
-                print(f"ERROR: VPN activation failed (exit code {result.returncode}).")
+    def connect() -> int:
+        nonlocal current_pins
+        current_pins = None
+        fortigate = Fortigate(fortigate_vpn_url, tls_fingerprint=None if auto_tls else tls_fingerprint,
+                             tls_refresh=renew_certificate if auto_tls else None)
+        url = fortigate.connect_saml()
+        if not url:
+            return 1
+        if auto_tls and current_pins is None:
+            # A server serving a full chain may rotate its key without a TLS error.
+            # Refresh the OpenConnect pin before handing it any credentials too.
+            try:
+                renew_certificate()
+            except TLSRefreshError as error:
+                report_tls_failure(fortigate_vpn_url, error)
                 return 1
-        except KeyboardInterrupt:
-            logger.debug("User interrupted process.")
-            print("CTRL+C/SIGTERM detected. Exiting.")
-            return 130
-    finally:
-        password_file.close()
-        try:
-            os.unlink(password_file.name)
-        except FileNotFoundError:
-            pass
 
-    return 0
+        # webserver to get the response from the IDP through browser request
+        ws = webserver.run()
+        webbrowser.open(url)
+        auth_id = webserver.return_token()
+        webserver.quit(ws)
+
+        if auth_id == '-1':
+            print("ERROR: Invalid ID from provider. Try again or contact your provider support.")
+            return 1
+
+        cookie_svpn = fortigate.get_cookie(auth_id)
+        if not cookie_svpn:
+            print("ERROR: FortiGate did not return an SVPNCOOKIE after SAML authentication.")
+            return 1
+
+        server_cert = current_pins.server_cert if current_pins else parser.server_cert or options.get('server_cert')
+        if not server_cert:
+            print('ERROR: "server_cert" is not set. Run --configure and provide the pin-sha256 value.')
+            return 2
+
+        password_file = tempfile.NamedTemporaryFile(
+            mode='w', prefix='fortigate-vpn-', delete=False
+        )
+        try:
+            password_file.write(f"vpn.secrets.cookie:SVPNCOOKIE={cookie_svpn}\n")
+            password_file.write(f"vpn.secrets.gwcert:{server_cert}\n")
+            password_file.write(f"vpn.secrets.gateway:{urlsplit(fortigate_vpn_url).netloc}\n")
+            password_file.write("vpn.secrets.resolve:\n")
+            password_file.close()
+            os.chmod(password_file.name, 0o600)
+
+            nmcli_command = [
+                "/usr/bin/nmcli", "con", "up", connection_name,
+                "passwd-file", password_file.name,
+            ]
+
+            openconnect_arguments = [
+                "--protocol=fortinet",
+                f"--servercert={server_cert}",
+                f"--server={fortigate_vpn_url}",
+                f"--useragent=fortigate-vpn-login-{__version__}:{os.uname().version}",
+                "--no-dtls",
+                "--non-inter",
+                "--disable-ipv6",
+                f"--cookie=SVPNCOOKIE={cookie_svpn}",
+            ]
+
+            if parser.QUIET_MODE:
+                openconnect_arguments.append("--quiet")
+
+            if parser.DEBUG_MODE:
+                openconnect_arguments.append("--verbose")
+
+            if parser.BACKGROUND:
+                openconnect_arguments.append("--quiet")
+                openconnect_arguments.append("--background")
+
+            command_line = []
+            if utils.is_windows():
+                workdir = openconnect_path.parent
+                command_line = [
+                    "powershell",
+                    "-Command",
+                    f"Start-Process '{str(openconnect_path)}' "
+                    f"-ArgumentList {','.join(openconnect_arguments)} "
+                    f"-Verb runAs -WorkingDirectory {workdir}",
+                ]
+            else:
+                if not os.getuid() == 0:
+                    command_line = nmcli_command
+                else:
+                    command_line = [str(openconnect_path)] + openconnect_arguments
+
+            env = os.environ.copy()
+            env['LC_ALL'] = 'C'
+
+            try:
+                result = subprocess.run(command_line, env=env)
+                if result.returncode:
+                    print(f"ERROR: VPN activation failed (exit code {result.returncode}).")
+                    return 1
+            except KeyboardInterrupt:
+                logger.debug("User interrupted process.")
+                print("CTRL+C/SIGTERM detected. Exiting.")
+                return 130
+        finally:
+            password_file.close()
+            try:
+                os.unlink(password_file.name)
+            except FileNotFoundError:
+                pass
+
+        return 0
+
+    keep_alive = parser.keep_alive or bool(parser.max_time) or options.getboolean('keep_alive')
+    if not keep_alive:
+        return connect()
+    if utils.is_windows() or os.getuid() == 0:
+        print('ERROR: --keep-alive requires running as a regular user with NetworkManager (nmcli).')
+        return 2
+    try:
+        max_time = keepalive.parse_duration(parser.max_time) if parser.max_time else None
+    except ValueError as error:
+        print(f'ERROR: {error}')
+        return 2
+    return keep_connected(connect, connection_name, max_time)
+
+
+def keep_connected(connect, connection_name: str, max_time: Optional[float] = None) -> int:
+    """
+    Keeps the VPN connected until the user disconnects it, presses CTRL+C or `max_time`
+    seconds pass. Every drop (dead peer, expired session, network change, ...) is
+    reported together with its cause and followed by a new login.
+    """
+    deadline = time.monotonic() + max_time if max_time else None
+    try:
+        result = connect()
+        if result:
+            return result
+        until = f" until {time.strftime('%H:%M', time.localtime(time.time() + max_time))}" if max_time else ''
+        keepalive.notify(f"VPN connected; keeping it up{until}. Press CTRL+C to stop watching.")
+        while True:
+            connected_at = time.time()
+            reason = keepalive.wait_for_disconnect(connection_name, deadline)
+            if reason is None:
+                subprocess.run(['nmcli', 'connection', 'down', connection_name])
+                keepalive.notify('Requested VPN time is over; VPN disconnected.')
+                return 0
+            if reason == keepalive.REASON_USER_DISCONNECTED:
+                keepalive.notify('VPN was disconnected by the user; not reconnecting.')
+                return 0
+            cause = keepalive.describe(reason, connected_at)
+            keepalive.notify(f"VPN connection lost: {cause}. Reconnecting...", urgency='critical')
+            attempt = 0
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    keepalive.notify('Requested VPN time is over; not reconnecting.')
+                    return 0
+                result = connect()
+                if result == 0:
+                    keepalive.notify(f"VPN connection restored after a drop: {cause}.")
+                    break
+                if result in (2, 130):
+                    return result
+                delay = min(300, 10 * 2 ** attempt)
+                attempt += 1
+                keepalive.notify(f"Reconnect attempt {attempt} failed; retrying in {delay} s.")
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        print("CTRL+C detected. Stopped watching the VPN; the current connection is left as it is.")
+        return 130
 
 
 if __name__ == "__main__":
